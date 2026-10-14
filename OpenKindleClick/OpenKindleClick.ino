@@ -706,6 +706,25 @@ static void forgetBonds() {
   startAdvertising();
 }
 
+static void onDisconnected(uint8_t hci_reason) {
+  g_conn = BLE_HS_CONN_HANDLE_NONE;
+  g_secured = false;
+  g_ready = false;
+  g_hid_notify_en = false;
+  g_bat_notify_en = false;
+  for (int k = 0; k < KEY_COUNT; k++) {
+    g_down[k] = false;
+    g_release_wanted[k] = false;
+  }
+  g_dirty = false;
+  g_last_activity = millis();
+  logmsg("[ble] disconnected (reason 0x%02X)\n", hci_reason);
+  if (g_auto_adv && !g_dormant) {
+    if (ble_gap_adv_active()) ble_gap_adv_stop();
+    startAdvertising();
+  }
+}
+
 static int onGapEvent(struct ble_gap_event* event, void* arg) {
   switch (event->type) {
     case BLE_GAP_EVENT_CONNECT: {
@@ -725,6 +744,7 @@ static int onGapEvent(struct ble_gap_event* event, void* arg) {
       g_bat_notify_en = false;
       g_last_activity = millis();
       g_conn = event->connect.conn_handle;
+      if (ble_gap_adv_active()) ble_gap_adv_stop();
 
       struct ble_gap_conn_desc desc;
       if (ble_gap_conn_find(event->connect.conn_handle, &desc) == 0) {
@@ -739,22 +759,7 @@ static int onGapEvent(struct ble_gap_event* event, void* arg) {
     }
 
     case BLE_GAP_EVENT_DISCONNECT: {
-      g_conn = BLE_HS_CONN_HANDLE_NONE;
-      g_secured = false;
-      g_ready = false;
-      g_hid_notify_en = false;
-      g_bat_notify_en = false;
-      for (int k = 0; k < KEY_COUNT; k++) {
-        g_down[k] = false;
-        g_release_wanted[k] = false;
-      }
-      g_dirty = false;
-      g_last_activity = millis();
-      uint8_t hci_reason = (uint8_t)(event->disconnect.reason & 0xFF);
-      logmsg("[ble] disconnected (reason 0x%02X)\n", hci_reason);
-      if (g_auto_adv && !g_dormant) {
-        startAdvertising();
-      }
+      onDisconnected((uint8_t)(event->disconnect.reason & 0xFF));
       return 0;
     }
 
@@ -815,8 +820,12 @@ static int onGapEvent(struct ble_gap_event* event, void* arg) {
     }
 
     case BLE_GAP_EVENT_ADV_COMPLETE: {
-      if (event->adv_complete.reason == BLE_HS_ETIMEOUT && g_auto_adv && !g_dormant && !connected()) {
-        startAdvertisingWithInterval(ADV_SLOW_INTERVAL, BLE_HS_FOREVER);
+      if (g_auto_adv && !g_dormant && !connected()) {
+        if (event->adv_complete.reason == BLE_HS_ETIMEOUT) {
+          startAdvertisingWithInterval(ADV_SLOW_INTERVAL, BLE_HS_FOREVER);
+        } else if (event->adv_complete.reason != 0) {
+          startAdvertising();
+        }
       }
       return 0;
     }
@@ -900,6 +909,30 @@ static void setupBle() {
 }
 
 static void serviceConnection() {
+  static uint32_t adv_stopped_since = 0;
+  uint16_t conn = g_conn;
+  if (conn != BLE_HS_CONN_HANDLE_NONE) {
+    adv_stopped_since = 0;
+    struct ble_gap_conn_desc desc;
+    if (ble_gap_conn_find(conn, &desc) != 0 && g_conn == conn) {
+      // NimBLE silently drops 0x3E (BLE_ERR_CONN_ESTABLISHMENT) without firing
+      // BLE_GAP_EVENT_DISCONNECT, and its internal ble_gap_slave_adv_reattempt()
+      // wipes raw ble_gap_adv_set_data() payloads.
+      onDisconnected(0x3E);
+      return;
+    }
+  } else if (g_ble_synced && g_auto_adv && !g_dormant && !ble_gap_adv_active()) {
+    uint32_t now = millis() | 1;
+    if (!adv_stopped_since) {
+      adv_stopped_since = now;
+    } else if (now - adv_stopped_since >= 200) {
+      adv_stopped_since = 0;
+      startAdvertising();
+    }
+    return;
+  } else {
+    adv_stopped_since = 0;
+  }
   if (!linkReady() || g_params_requested) return;
   if (millis() - g_ready_at < CONN_PARAM_DELAY_MS) return;
   g_params_requested = true;
